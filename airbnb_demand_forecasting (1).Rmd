@@ -1,0 +1,183 @@
+---
+title: "GuidedProject"
+author: "CHARISHMA KATTA "
+date: "2025-03-25"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load all necessary packages
+
+```{r}
+rm(list=ls())
+
+# Load the packages
+library(fpp3)
+library(codetools)
+library(languageserver)
+library(markdown)
+library(dplyr)
+library(knitr)
+# Set up chunk for all slides
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  dev.args = list(pointsize = 11)
+)
+options(
+  digits = 3,
+  width = 75,
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis",
+  ggplot2.discrete.colour = c("#D55E00", "#0072B2", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442"),
+  ggplot2.discrete.fill = c("#D55E00", "#0072B2", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442")
+)
+```
+
+```{r}
+##----------------------------------------------------------------------------##
+## Project: Monthly Airbnb Demand Forecasting - Fortworth
+## Instructor: Dr. Jabir Rahman
+##----------------------------------------------------------------------------##
+
+library(fpp3)
+library(readr)
+library(dbplyr)
+library(tseries)
+
+# 1. LOAD DATA
+path_to_data <- "data/reviews.csv"
+raw_data <- read_csv(path_to_data)
+
+# 2. DATA PREPARATION & MONTHLY AGGREGATION
+# We aggregate the 'count' from the raw data into monthly buckets
+library(lubridate)
+
+# Convert FIRST
+raw_data <- raw_data %>%
+  mutate(date = ymd(date))
+
+# Now this works
+last_date <- max(raw_data$date, na.rm = TRUE)
+
+last_complete_month <- yearmonth(
+  floor_date(last_date, "month") - days(1)
+)
+
+airbnb <- raw_data %>%
+  mutate(month = yearmonth(date)) %>%
+  count(month, name = "count") %>%
+  filter(month <= last_complete_month) %>%
+  as_tsibble(index = month) %>%
+  mutate(log_count = log1p(count))
+
+# 3. EXPLORATORY DATA ANALYSIS (Shortened to post-2022 for stability)
+airbnb_short <- airbnb %>% filter(year(month) >2022)
+sum(is.na(airbnb_short$count))
+
+# Visualization of Trend and Seasonality
+airbnb_short %>% autoplot(log_count) + 
+  labs(title = "Monthly Airbnb Log-Demand (Fortworth)", y = "Log(Count)")
+
+# Stationary check (ADF test)
+# Part 1 Rubric: Statistical Stationarity Check
+# Using nsdiffs and ndiffs as the primary statistical evidence for stationarity
+print("--- Statistical Property Check ---")
+stats_check <- airbnb_short %>%
+  features(log_count, list(unitroot_ndiffs, unitroot_nsdiffs))
+
+knitr::kable(stats_check, caption = "Stationarity Property Check (Required Diffs)")
+library(tseries)
+log_count_vec <- as.numeric(airbnb_short$log_count)
+adf_result <- adf.test(log_count_vec)
+print(adf_result)
+kpss_result <- kpss.test(log_count_vec, null = "Level")
+print(kpss_result)
+pp_result <- pp.test(log_count_vec)
+print(pp_result)
+
+# STL Decomposition
+airbnb_short %>%
+  model(stl = STL(log_count)) %>%
+  components() %>%
+  autoplot() + labs(title = "STL Decomposition: Trend, Seasonality, and Randomness")
+
+# 4. TRAIN/TEST SPLIT
+# Hold out the last 6 months for testing
+h_horizon <- 6
+train <- airbnb_short %>% slice(1:(n() - h_horizon))
+test  <- airbnb_short %>% slice_tail(n = h_horizon)
+
+# 5. BUILD ALL MODELS (Consolidated)
+# This includes Baseline, Exponential Smoothing, ARIMA, and others
+fit_all <- train %>%
+  model(
+    # Part 2: Baseline
+    Mean = MEAN(log_count),
+    `Naïve` = NAIVE(log_count),
+    `Seasonal Naïve` = SNAIVE(log_count),
+    Drift = RW(log_count ~ drift()),
+    ETS = ETS(log_count),
+    Auto_ARIMA = ARIMA(log_count),
+    Manual_SARIMA = ARIMA(log_count ~ pdq(1,0,0) + PDQ(0,0,0)),
+    NNETAR = NNETAR(log_count),
+    Regression = TSLM(log_count ~ trend() + season()),
+  )
+# LJUNG- BOX test
+lb_results <- fit_all %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 12) %>%
+  rename(LB_pvalue = lb_pvalue)
+# 6. FORECASTING
+fc_all <- fit_all %>% forecast(h = h_horizon)
+
+# 7. MODEL COMPARISON
+accuracy_table <- fc_all %>%
+  accuracy(airbnb_short) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  left_join(lb_results, by = ".model") %>%
+  arrange(RMSE)
+
+kable(
+  accuracy_table,
+  caption = "Table 1: Forecast Model Accuracy Comparison"
+)
+
+# 8. FINAL VISUALIZATION
+fc_all %>%
+  autoplot(airbnb_short, level = NULL) +
+  labs(
+    y = "Log(Count)",
+    title = "Forecast vs Actuals",
+    subtitle = "Fortworth Airbnb Reviews"
+  ) +
+  theme_minimal()
+
+# FINAL MODEL
+final_production_fit <- airbnb_short %>%
+  model(Best_Model = TSLM(log_count ~ trend() + season()))
+
+final_production_fit %>% gg_tsresiduals()
+
+# 9. RESIDUAL DIAGNOSTIC TEST (Ljung-Box Test)
+ljung_box_test <- final_production_fit %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 12)
+
+kable(ljung_box_test, caption = "Ljung-Box Test for Residual Independence")
+
+final_production_fit %>%
+  forecast(h = 6) %>%
+  autoplot(airbnb_short) +
+  labs(title = "Final 6-Month Forecast", 
+       subtitle = "Optimized via Regression (TSLM)", 
+       y = "Log(Count)") +
+  theme_minimal()
+```
